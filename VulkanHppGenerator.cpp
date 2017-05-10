@@ -350,6 +350,68 @@ const std::string arrayProxyHeader = R"(
 #endif
 )";
 
+
+const std::string arrayRefHeader = R"(
+  template <typename T>
+  class ArrayRef
+  {
+  public:
+    ArrayRef(std::nullptr_t)
+      : m_count(0)
+      , m_ptr(nullptr)
+    {}
+
+    ArrayRef(T & ptr)
+      : m_count(1)
+      , m_ptr(&ptr)
+    {}
+    
+    ArrayRef(T && ptr) = delete;
+
+    ArrayRef(uint32_t count, T * ptr)
+      : m_count(count)
+      , m_ptr(ptr)
+    {}
+
+    template <size_t N>
+    ArrayRef(std::array<typename std::remove_const<T>::type, N> const& data)
+      : m_count(N)
+      , m_ptr(data.data())
+    {}
+    
+    template <size_t N>
+    ArrayRef(std::array<typename std::remove_const<T>::type, N> const&& data) = delete;
+
+    template <class Allocator = std::allocator<typename std::remove_const<T>::type>>
+    ArrayRef(std::vector<typename std::remove_const<T>::type, Allocator> const& data)
+      : m_count(static_cast<uint32_t>(data.size()))
+      , m_ptr(data.data())
+    {}
+    
+    template <class Allocator = std::allocator<typename std::remove_const<T>::type>>
+    ArrayRef(std::vector<typename std::remove_const<T>::type, Allocator> const&& data) = delete;
+
+    bool empty() const
+    {
+      return (m_count == 0);
+    }
+
+    uint32_t size() const
+    {
+      return m_count;
+    }
+
+    T const* data() const
+    {
+      return m_ptr;
+    }
+
+  private:
+    uint32_t  m_count;
+    T const*       m_ptr;
+  };
+)";
+
 const std::string versionCheckHeader = R"(
 #if !defined(VULKAN_HPP_HAS_UNRESTRICTED_UNIONS)
 # if defined(__clang__)
@@ -706,6 +768,7 @@ struct MemberData
   std::string name;
   std::string arraySize;
   std::string pureType;
+  std::string len;
 };
 
 struct StructData
@@ -714,10 +777,12 @@ struct StructData
     : returnedOnly(false)
   {}
 
-  bool                    returnedOnly;
-  bool                    isUnion;
-  std::vector<MemberData> members;
-  std::string             protect;
+  bool                     returnedOnly;
+  bool                     isUnion;
+  std::vector<MemberData>  members;
+  std::string              protect;
+  std::set<size_t>         skippedMembers;
+  std::map<size_t, size_t> vectorMembers;
 };
 
 struct DeleterData
@@ -751,6 +816,7 @@ void determineReturnParam(CommandData & commandData);
 void determineSkippedParams(CommandData & commandData);
 void determineTemplateParam(CommandData & commandData);
 void determineVectorParams(CommandData & commandData);
+void determineVectorParams(StructData & commandData);
 void enterProtect(std::ostream &os, std::string const& protect);
 std::string extractTag(std::string const& name);
 std::string findTag(std::string const& name, std::set<std::string> const& tags);
@@ -1055,6 +1121,32 @@ void determineVectorParams(CommandData & commandData)
         || (it->len == "null-terminated")
         || (it->len == "pAllocateInfo::descriptorSetCount")
         || (it->len == "pAllocateInfo::commandBufferCount"));
+    }
+  }
+}
+
+void determineSkippedParams(StructData & structData)
+{
+  // the size-parameters of vector parameters are not explicitly used in the enhanced API
+  std::for_each(structData.vectorMembers.begin(), structData.vectorMembers.end(), [&structData](std::pair<size_t, size_t> const& vp) { if (vp.second != ~0) structData.skippedMembers.insert(vp.second); });
+}
+
+void determineVectorParams(StructData & structData)
+{
+  // look for the parameters whose len equals the name of an other parameter
+  for (auto it = structData.members.begin(), begin = it, end = structData.members.end(); it != end; ++it)
+  {
+    if (!it->len.empty())
+    {
+      auto findLambda = [it](MemberData const& pd) { return pd.name == it->len; };
+      auto findIt = std::find_if(begin, it, findLambda);                        // look for a parameter named as the len of this parameter
+      assert((std::count_if(begin, end, findLambda) == 0) || (findIt < it));    // make sure, there is no other parameter like that
+      // add this parameter as a vector parameter, using the len-name parameter as the second value (or ~0 if there is nothing like that)
+      structData.vectorMembers.insert(std::make_pair(std::distance(begin, it), findIt < it ? std::distance(begin, findIt) : ~0));
+      assert((structData.vectorMembers[std::distance(begin, it)] != ~0)
+        || (it->len == "null-terminated")
+        || (it->len == "latexmath:[codeSize \\over 4]")
+        || (it->len == "latexmath:[\\lceil{\\mathit{rasterizationSamples} \\over 32}\\rceil]"));
     }
   }
 }
@@ -1796,6 +1888,9 @@ void readTypeStruct( tinyxml2::XMLElement * element, VkData & vkData, bool isUni
     readTypeStructMember( child, it->second.members, vkData.dependencies.back().dependencies );
   }
 
+  determineVectorParams(it->second);
+  determineSkippedParams(it->second);
+
   assert( vkData.vkTypes.find( name ) == vkData.vkTypes.end() );
   vkData.vkTypes.insert( name );
 }
@@ -1804,6 +1899,17 @@ void readTypeStructMember(tinyxml2::XMLElement * element, std::vector<MemberData
 {
   members.push_back(MemberData());
   MemberData & member = members.back();
+
+  if (element->Attribute("len"))
+  {
+    member.len = element->Attribute("len");
+
+    std::string::size_type pos = member.len.find(",");
+    if (pos != std::string::npos)
+    {
+      member.len = member.len.substr(0, pos);
+    }
+  }
 
   tinyxml2::XMLNode* child = readType(element->FirstChild(), member.type, member.pureType);
   dependencies.insert(member.pureType);
@@ -3133,6 +3239,7 @@ void writeStructConstructor( std::ofstream & ofs, std::string const& name, Struc
     << std::endl;
 }
 
+// TODO seperate enhance and standard function
 void writeStructSetter( std::ofstream & ofs, std::string const& structureName, MemberData const& memberData, std::set<std::string> const& vkTypes )
 {
   if (memberData.type != "StructureType") // filter out StructureType, which is supposed to be immutable !
@@ -3720,6 +3827,7 @@ bool containsUnion(std::string const& type, std::map<std::string, StructData> co
   return found;
 }
 
+// TODO split in standard and enhanced version
 void writeTypeStruct( std::ofstream & ofs, VkData const& vkData, DependencyData const& dependencyData, std::map<std::string,std::string> const& defaultValues )
 {
   std::map<std::string,StructData>::const_iterator it = vkData.structs.find( dependencyData.name );
@@ -3740,7 +3848,31 @@ void writeTypeStruct( std::ofstream & ofs, VkData const& vkData, DependencyData 
   {
     for (size_t i = 0; i<it->second.members.size(); i++)
     {
-      writeStructSetter( ofs, dependencyData.name, it->second.members[i], vkData.vkTypes );
+      if (it->second.skippedMembers.find(i) == it->second.skippedMembers.end())
+      {
+        if (it->second.vectorMembers.find(i) == it->second.vectorMembers.end())
+        {
+          writeStructSetter( ofs, dependencyData.name, it->second.members[i], vkData.vkTypes );
+        }
+        else
+        {
+          auto memberData = it->second.members[i];
+
+          std::string strippedParameterName = startLowerCase(strip(memberData.name, "p"));
+          size_t rightStarPos = memberData.type.rfind('*');
+
+          // the setters return a reference to the structure
+          ofs << "    " << dependencyData.name << "& set" << startUpperCase(strippedParameterName) << "( "
+              << "ArrayRef<" << trimEnd(memberData.type.substr(0, rightStarPos)) << "> "
+              << strippedParameterName << ")" << std::endl
+              << "    {" << std::endl
+              << "      " << memberData.name << " = " << strippedParameterName << ".data();" << std::endl
+              << "      " << memberData.len << " = " << strippedParameterName << ".size();" << std::endl
+              << "      return *this;" << std::endl
+              << "    }" << std::endl
+              << std::endl;
+        }
+      }
     }
   }
 
@@ -4082,6 +4214,7 @@ int main( int argc, char **argv )
       << flagsHeader
       << optionalClassHeader
       << arrayProxyHeader
+      << arrayRefHeader
       << uniqueHandleHeader;
 
     // first of all, write out vk::Result and the exception handling stuff
