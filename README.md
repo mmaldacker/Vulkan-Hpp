@@ -1,5 +1,10 @@
 # Vulkan-Hpp: C++ Bindings for Vulkan
 
+## CI Build Status
+| Platform | Build Status |
+|:--------:|:------------:|
+| Linux | [![Build Status](https://travis-ci.org/KhronosGroup/Vulkan-Hpp.svg?branch=master)](https://travis-ci.org/KhronosGroup/Vulkan-Hpp) |
+
 The goal of the Vulkan-Hpp is to provide header only C++ bindings for the Vulkan C API to improve the developers Vulkan experience without introducing CPU runtime cost. It adds features like type safety for enums and bitfields, STL container support, exceptions and simple enumerations.
 
 # Getting Started
@@ -7,7 +12,7 @@ Vulkan-Hpp is part of the LunarG Vulkan SDK since version 1.0.24. Just include `
 
 # Minimum Requirements
 Vulkan-Hpp requires a C++11 capable compiler to compile. The following compilers are known to work:
-* Visual Studio >=2013
+* Visual Studio >=2015
 * GCC >= 4.8.2 (earlier version might work, but are untested)
 * Clang >= 3.3
 
@@ -23,6 +28,8 @@ To avoid name collisions with the Vulkan C API the C++ bindings reside in the vk
   * ```VK_COLOR_SPACE_SRGB_NONLINEAR_KHR``` is now ```vk::ColorSpaceKHR::eSrgbNonlinear```.
   *  ```VK_STRUCTURE_TYPE_PRESENT_INFO_KHR``` is now ```vk::StructureType::ePresentInfoKHR```.
 *  Flag bits are handled like scoped enums with the addition that the _BIT suffix has also been removed.
+
+In some cases it might be necessary to move Vulkan-Hpp to a custom namespace. This can be achieved by defining VULKAN_HPP_NAMESPACE before including Vulkan-Hpp.
 
 # Handles
 Vulkan-Hpp declares a class for all handles to ensure full type safety and to add support for member functions on handles. A member function has been added to a handle class for each
@@ -155,6 +162,32 @@ vkSubresourceLayout layout = vkGetImageSubResourceLayout(image, subresource);
 auto layout = device.getImageSubResourceLayout(image, { {} /* flags*/, 0 /* miplevel */, 0 /* layout */ });
 ```
 
+# Structure Pointer Chains
+Vulkan allows chaining of structures through the pNext pointer. Vulkan-Hpp has a variadic template class which allows constructing of such structure chains with minimal efforts.
+In addition to this it checks at compile time if the spec allows the construction of such a pNext chain.
+
+```
+// This will compile successfully.
+vk::StructureChain<vk::MemoryAllocateInfo, vk::ImportMemoryFdInfoKHR> c;
+vk::MemoryAllocateInfo &allocInfo = c.get<vk::MemoryAllocateInfo>();
+vk::ImportMemoryFdInfoKHR &fdInfo = c.get<vk::ImportMemoryFdInfoKHR>();
+
+// This will fail compilation since it's not valid according to the spec.
+vk::StructureChain<vk::MemoryAllocateInfo, vk::MemoryDedicatedRequirementsKHR> c;
+vk::MemoryAllocateInfo &allocInfo = c.get<vk::MemoryAllocateInfo>();
+vk::ImportMemoryFdInfoKHR &fdInfo = c.get<vk::ImportMemoryFdInfoKHR>();
+```
+
+Sometimes the user has to pass a preallocated structure chain to query information. In those cases the corresponding query functions are variadic templates and do accept a structure chain to construct the return value:
+
+```
+// Query vk::MemoryRequirements2KHR and vk::MemoryDedicatedRequirementsKHR when calling Device::getBufferMemoryRequirements2KHR:
+auto result = device.getBufferMemoryRequirements2KHR<vk::MemoryRequirements2KHR, vk::MemoryDedicatedRequirementsKHR>({});
+vk::MemoryRequirements2KHR &memReqs = result.get<vk::MemoryRequirements2KHR>();
+vk::MemoryDedicatedRequirementsKHR &dedMemReqs = result.get<vk::MemoryDedicatedRequirementsKHR>();
+```
+
+
 # Return values, Error Codes & Exceptions
 By default Vulkan-Hpp has exceptions enabled. This means that Vulkan-Hpp checks the return code of each function call which returns a Vk::Result. If Vk::Result is a failure a std::runtime_error will be thrown.
 Since there is no need to return the error code anymore the C++ bindings can now return the actual desired return value, i.e. a vulkan handle. In those cases ResultValue <SomeType>::type is defined as the returned type.
@@ -260,7 +293,18 @@ properties.resize(propertyCount);
 ```
 Since writing this loop over and over again is tedious and error prone the C++ binding takes care of the enumeration so that you can just write:
 
+```
 std::vector<LayerProperties> properties = physicalDevice.enumerateDeviceLayerProperties();
+```
+
+# UniqueHandle
+Vulkan-Hpp provides a ```vk::UniqueHandle<Type, Deleter>``` interface. For each Vulkan handle type ```vk::Type``` there is a unqiue handle ```vk::UniqueType``` which will delete the underlying Vulkan resource upon destruction, e.g.
+```vk::UniqueBuffer ``` is the unique handle for ```vk::Buffer```.
+
+For each function which constructs a Vulkan handle of type ```vk::Type``` Vulkan-Hpp provides a second version which returns a ```vk::UnqiueType```. E.g. for ```vk::Device::createBuffer``` there is ```vk::Device::createBufferUnique``` and for ```vk::allocateCommandBuffers```
+there is ```vk::allocateCommandBuffersUnique```.
+
+Note that using ```vk::UniqueHandle``` comes at a cost since most deleters have to store the ```vk::AllocationCallbacks``` and parent handle used for construction because they are required for automatic destruction.
 
 # Custom allocators
 Sometimes it is required to use ```std::vector``` with custom allocators. Vulkan-Hpp supports vectors with custom allocators as input for ```vk::ArrayProx``` and for functions which do return a vector. For the latter case, add your favorite custom allocator as template argument to the function call like this:
